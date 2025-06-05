@@ -1,0 +1,223 @@
+import cv2
+from ultralytics import YOLO
+import pandas as pd
+import numpy as np
+import numpy.polynomial.legendre as leg # Para cuadratura de Gauss-Legendre
+
+# --- Constantes ---
+DIAMETRO_REAL_MONEDA_CM = 2.8  # Ajusta si es otra moneda
+RUTA_MODELO_MONEDA = "C:/Users/gaell/Documents/Visual Studio 2017/Python/runs/detect/train/weights/best.pt"
+RUTA_MODELO_BACHE = "C:/Users/gaell/Documents/Visual Studio 2017/Python/runs/detect/bache_detector/weights/best.pt"
+
+# Densidad aproximada de la mezcla asfáltica en kg/m³
+# Este valor puede variar (típicamente entre 2200 y 2500 kg/m³)
+DENSIDAD_MEZCLA_ASFALTICA_KG_POR_M3 = 2300
+
+# --- Datos de Referencia de Baches ---
+datos_baches_lista = [
+    # Nº Diámetro (cm) Profundidad (cm) Nivel de Severidad
+    [1, 60, 12, 'Alto'], [2, 60, 15, 'Alto'], [3, 85, 2, 'Medio'], [4, 50, 1.2, 'Medio'],
+    [5, 15.2, 1.4, 'Bajo'], [6, 63.5, 9, 'Medio'], [7, 45, 3, 'Bajo'], [8, 55, 2.5, 'Bajo'],
+    [9, 40, 4, 'Bajo'], [10, 35, 3.5, 'Bajo'], [11, 30, 2, 'Bajo'], [12, 25, 1.8, 'Bajo'],
+    [13, 20, 1.5, 'Bajo'], [14, 18, 1.2, 'Bajo'], [15, 16, 1, 'Bajo'], [16, 14, 0.8, 'Bajo'],
+    [17, 12, 0.6, 'Bajo'], [18, 10, 0.5, 'Bajo'], [19, 8, 0.4, 'Bajo'], [20, 6, 0.3, 'Bajo'],
+    [21, 5, 0.2, 'Bajo'], [22, 4, 0.15, 'Bajo'], [23, 3, 0.1, 'Bajo'], [24, 2.5, 0.08, 'Bajo'],
+    [25, 2, 0.06, 'Bajo'], [26, 1.5, 0.05, 'Bajo'], [27, 1, 0.04, 'Bajo'], [28, 0.8, 0.03, 'Bajo'],
+    [29, 0.5, 0.02, 'Bajo'], [30, 0.3, 0.01, 'Bajo'], [31, 65, 10, 'Alto'], [32, 70, 11, 'Alto'],
+    [33, 75, 13, 'Alto'], [34, 80, 14, 'Alto'], [35, 85, 15, 'Alto'], [36, 90, 16, 'Alto'],
+    [37, 95, 17, 'Alto'], [38, 100, 18, 'Alto'], [39, 105, 19, 'Alto'], [40, 110, 20, 'Alto'],
+    [41, 115, 21, 'Alto'], [42, 120, 22, 'Alto'], [43, 125, 23, 'Alto'], [44, 130, 24, 'Alto'],
+    [45, 135, 25, 'Alto'], [46, 140, 26, 'Alto'], [47, 145, 27, 'Alto'], [48, 150, 28, 'Alto'],
+    [49, 155, 29, 'Alto'], [50, 160, 30, 'Alto']
+]
+
+df_datos_baches = pd.DataFrame(datos_baches_lista, columns=['Nº', 'Diametro (cm)', 'Profundidad (cm)', 'Nivel de Severidad'])
+df_datos_baches = df_datos_baches.groupby('Diametro (cm)').agg(
+    {'Profundidad (cm)': 'mean', 'Nivel de Severidad': 'first', 'Nº': 'first'}
+).reset_index()
+df_datos_baches = df_datos_baches.sort_values(by='Diametro (cm)').reset_index(drop=True)
+
+# --- Funciones ---
+def detectar_objetos(modelo_path, ruta_imagen):
+    modelo = YOLO(modelo_path)
+    resultados = modelo(ruta_imagen)
+    return resultados[0]
+
+def calcular_escala_moneda(moneda_box):
+    x1, y1, x2, y2 = map(int, moneda_box.xyxy[0])
+    diametro_px = max(x2 - x1, y2 - y1)
+    if diametro_px == 0: return 0, (x1, y1, x2, y2)
+    escala = DIAMETRO_REAL_MONEDA_CM / diametro_px
+    return escala, (x1, y1, x2, y2)
+
+def obtener_bache_mas_grande(bache_boxes):
+    mayor_area = 0
+    bache_grande = None
+    for box in bache_boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        area = (x2 - x1) * (y2 - y1)
+        if area > mayor_area:
+            mayor_area = area
+            bache_grande = box
+    return bache_grande
+
+def calcular_dimensiones_bache(bache_box, escala):
+    x1, y1, x2, y2 = map(int, bache_box.xyxy[0])
+    ancho_px = x2 - x1
+    alto_px = y2 - y1
+    ancho_cm = ancho_px * escala
+    alto_cm = alto_px * escala
+    return ancho_cm, alto_cm, (x1, y1, x2, y2)
+
+def estimar_profundidad_bache(diametro_referencia_cm, df_referencia):
+    if df_referencia.empty: return 0, "Desconocida"
+    idx_mas_cercano = (df_referencia['Diametro (cm)'] - diametro_referencia_cm).abs().idxmin()
+    fila_mas_cercana = df_referencia.loc[idx_mas_cercano]
+    return fila_mas_cercana['Profundidad (cm)'], fila_mas_cercana['Nivel de Severidad']
+
+def cuadratura_gauss_2d(f, ax, bx, ay, by, n=5):
+    """
+    Aplica cuadratura de Gauss-Legendre 2D sobre la función f(x,y).
+    n: número de puntos de cuadratura (por eje).
+    """
+    [x_nodes, wx] = leg.leggauss(n)
+    [y_nodes, wy] = leg.leggauss(n)
+
+    # Cambio de intervalo [-1,1] a [a,b]
+    tx = 0.5 * (bx - ax)
+    cx = 0.5 * (bx + ax)
+    ty = 0.5 * (by - ay)
+    cy = 0.5 * (by + ay)
+
+    suma = 0
+    for i in range(n):
+        for j in range(n):
+            xi = tx * x_nodes[i] + cx
+            yj = ty * y_nodes[j] + cy
+            suma += wx[i] * wy[j] * f(xi, yj)
+    return tx * ty * suma
+
+def calcular_mezcla_asfaltica_kg(volumen_cm3):
+    """Calcula los kg de mezcla asfáltica necesarios."""
+    volumen_m3 = volumen_cm3 / (100**3) # Convertir cm³ a m³
+    masa_kg = volumen_m3 * DENSIDAD_MEZCLA_ASFALTICA_KG_POR_M3
+    return masa_kg
+
+def analizar_imagen(ruta_imagen):
+    print(f"Analizando imagen: {ruta_imagen}")
+    moneda_result = detectar_objetos(RUTA_MODELO_MONEDA, ruta_imagen)
+    bache_result = detectar_objetos(RUTA_MODELO_BACHE, ruta_imagen)
+
+    if not moneda_result.boxes:
+        print("No se detectó ninguna moneda. No se puede calcular la escala.")
+        return
+
+    imagen = cv2.imread(ruta_imagen)
+    if imagen is None:
+        print(f"Error: No se pudo cargar la imagen desde {ruta_imagen}")
+        return
+
+    escala, moneda_coords = calcular_escala_moneda(moneda_result.boxes[0])
+    if escala == 0:
+        print("Error: Diámetro de moneda en píxeles es cero. No se puede calcular escala.")
+        return
+
+    print(f"Escala calculada: {escala:.4f} cm/píxel")
+    mx1, my1, mx2, my2 = moneda_coords
+    cv2.rectangle(imagen, (mx1, my1), (mx2, my2), (0, 255, 0), 2)
+    cv2.putText(imagen, f"Moneda ({DIAMETRO_REAL_MONEDA_CM} cm)", (mx1, my1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    if not bache_result.boxes:
+        print("No se detectó ningún bache.")
+        salida = "resultado_sin_baches.jpg"
+        cv2.imwrite(salida, imagen)
+        print(f"Resultado (sin baches) guardado como '{salida}'")
+        return
+
+    bache_grande = obtener_bache_mas_grande(bache_result.boxes)
+    if bache_grande:
+        ancho_cm, alto_cm, bache_coords = calcular_dimensiones_bache(bache_grande, escala)
+        bx1, by1, bx2, by2 = bache_coords
+
+        diametro_referencia_bache_cm = (ancho_cm + alto_cm) / 2.0
+        profundidad_max_estimada_cm, severidad_estimada = estimar_profundidad_bache(diametro_referencia_bache_cm, df_datos_baches)
+
+        print(f"Bache más grande - Ancho: {ancho_cm:.2f} cm, Alto: {alto_cm:.2f} cm")
+        print(f"  Diámetro de referencia para estimación: {diametro_referencia_bache_cm:.2f} cm")
+        print(f"  Profundidad Máxima Estimada (de tabla, h): {profundidad_max_estimada_cm:.2f} cm")
+        print(f"  Severidad Estimada: {severidad_estimada}")
+
+        volumen_gauss_cm3 = 0
+        volumen_analitico_cm3 = 0
+        mezcla_kg = 0
+        etiqueta_bache_base = f"B: {ancho_cm:.1f}x{alto_cm:.1f}cm, P:{profundidad_max_estimada_cm:.1f}cm ({severidad_estimada})"
+
+        if ancho_cm > 0 and alto_cm > 0 and profundidad_max_estimada_cm > 0:
+            h_max = profundidad_max_estimada_cm
+            semi_eje_a = ancho_cm / 2.0
+            semi_eje_b = alto_cm / 2.0
+
+            # Perfil parabólico (z es la profundidad)
+            def perfil_parabolico(x, y):
+                # x, y relativos al centro del bache en la superficie
+                val = h_max * (1 - (x / semi_eje_a)**2 - (y / semi_eje_b)**2)
+                return max(val, 0)
+
+            # Volumen con cuadratura de Gauss (numérico)
+            volumen_gauss_cm3 = cuadratura_gauss_2d(perfil_parabolico,
+                                                 -semi_eje_a, semi_eje_a,
+                                                 -semi_eje_b, semi_eje_b,
+                                                 n=5) # n=3 o n=5 suele ser suficiente
+            print(f"  Volumen Numérico (Gauss 2D, paraboloide): {volumen_gauss_cm3:.2f} cm³")
+
+            # Volumen analítico para un paraboloide elíptico
+            volumen_analitico_cm3 = (1/2) * np.pi * semi_eje_a * semi_eje_b * h_max
+            print(f"  Volumen Analítico (paraboloide elíptico): {volumen_analitico_cm3:.2f} cm³")
+            
+            # Calcular mezcla asfáltica usando el volumen analítico (o el de Gauss si se prefiere para formas más complejas)
+            mezcla_kg = calcular_mezcla_asfaltica_kg(volumen_analitico_cm3)
+            print(f"  Mezcla asfáltica necesaria (aprox.): {mezcla_kg:.2f} kg")
+            
+            etiqueta_bache_completa = f"{etiqueta_bache_base}\nV:{volumen_analitico_cm3:.0f}cm3, M:{mezcla_kg:.1f}kg"
+        else:
+            print("  No se puede calcular el volumen/mezcla: dimensiones no positivas.")
+            etiqueta_bache_completa = etiqueta_bache_base
+
+        # Dibujar en la imagen
+        cv2.rectangle(imagen, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+        
+        # Para múltiples líneas en cv2.putText, hay que dibujarlas por separado
+        y_text_start = by2 + 20
+        line_height = 18 # Ajustar según el tamaño de la fuente
+        
+        # Manejo si el texto se sale por abajo
+        num_lines = etiqueta_bache_completa.count('\n') + 1
+        if y_text_start + (num_lines * line_height) > imagen.shape[0] -10:
+            y_text_start = by1 - (num_lines * line_height) - 5 # Poner encima
+
+        for i, line in enumerate(etiqueta_bache_completa.split('\n')):
+            y = y_text_start + i * line_height
+            cv2.putText(imagen, line, (bx1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1) # Grosor 1 para más líneas
+
+    else:
+        print("No se encontró un bache válido.")
+
+    salida = "resultado_bache_con_volumen_y_mezcla.jpg"
+    cv2.imwrite(salida, imagen)
+    print(f"Resultado guardado como '{salida}'")
+    # Descomentar para visualización directa:
+    # cv2.imshow("Resultado", imagen)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+# --- Ejecución ---
+if __name__ == "__main__":
+    # Asegúrate de que la ruta de la imagen es correcta y la imagen existe.
+    ruta_imagen_prueba = "ProyectoBaches/bache2.jpg" # CAMBIA ESTO A LA RUTA DE TU IMAGEN
+    # Ejemplo de creación de un directorio si no existe (opcional)
+    # import os
+    # if not os.path.exists("ProyectoBaches"):
+    # os.makedirs("ProyectoBaches")
+    # print("Directorio 'ProyectoBaches' creado. Por favor, coloca una imagen de prueba como 'bache1.jpg' dentro.")
+    
+    analizar_imagen(ruta_imagen_prueba)
