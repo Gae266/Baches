@@ -7,7 +7,7 @@ from ultralytics import YOLO
 from torchvision.transforms import Compose
 
 # === Añadir ruta a MiDaS (ajustar según sea necesario) === pip install timm
-sys.path.append("C:/Users/gaell/Desktop/Baches/Codigo/MiDaS/MiDaS")
+sys.path.append("C:/Users/gaell/Desktop/Baches/Codigo/MiDaS")
 
 # === Importar MiDaS ===
 from midas.dpt_depth import DPTDepthModel
